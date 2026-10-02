@@ -2,7 +2,7 @@
 
 Uma extensão para acompanhar a letra enquanto você ouve música no YouTube. O verso que está sendo cantado ganha destaque, e a letra rola junto com a música.
 
-![Refrão mostrando a letra de Here I Am, do Shaman, sobre o vídeo no YouTube](docs/images/refrao-youtube.png)
+![Refrão mostrando a letra de Dine N'Dash, do The Strokes, sobre o vídeo no YouTube](docs/images/refrao-youtube.png)
 
 Funciona no Chrome e no Microsoft Edge, no computador. As letras vêm do [LRCLIB](https://lrclib.net), e a sincronização depende da versão disponível por lá. Não precisa criar conta.
 
