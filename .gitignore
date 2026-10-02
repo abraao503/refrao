@@ -1,0 +1,11 @@
+node_modules
+.output
+.wxt
+dist
+.DS_Store
+.env
+.env.*
+!.env.example
+.agents/
+.codex/
+.aws/
