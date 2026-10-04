@@ -20,7 +20,9 @@ export const defaultSettings: UserSettings = {
 };
 
 const SETTINGS_KEY = "refraoSettings";
-const CACHE_VERSION = "v4";
+// Old automatic lookups may have used a stale or mislabelled music card.
+// Manual selections and per-video timing adjustments use separate keys.
+const CACHE_VERSION = "v5";
 const VIDEO_OFFSET_VERSION = "v1";
 
 function mergeSettings(value: Partial<UserSettings> | undefined): UserSettings {

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { getLyricsById, getLyricsByMetadata, getLookupSignatures, hasCompatibleDuration, isCompatibleRecord, rankCandidates, searchLyrics } from "./lrclib";
+import { getLyricsById, getLyricsByMetadata, getLookupSignatures, hasCompatibleDuration, isCompatibleRecord, rankCandidates, searchLyrics, searchLyricsForMetadata } from "./lrclib";
 import type { LyricsRecord, LrclibRecord, VideoMetadata } from "./types";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -132,6 +132,139 @@ describe("LRCLIB candidate ranking", () => {
     ]);
     expect(ranked[0]).toMatchObject({ id: 11506272, confidence: 1 });
     expect(ranked[1].confidence).toBeLessThan(0.9);
+  });
+});
+
+describe("artist spelling compatibility", () => {
+  const live: VideoMetadata = {
+    ...metadata, title: "I Started A Joke (Live in Las Vegas, 1997 - One Night Only)",
+    artist: "Bee Gees", duration: 182.1, mediaType: "unknown",
+  };
+  const recording: LrclibRecord = {
+    id: 1, trackName: `Bee Gees - ${live.title}`, artistName: "beegees", duration: 182,
+    syncedLyrics: "[00:09.00] First line\n[00:13.00] Second line",
+  };
+
+  it("ranks the Bee Gees Live candidates from the reported video as exact artist matches", () => {
+    const ranked = rankCandidates(live, [
+      { ...recording, id: 2, duration: 183, confidence: 0 },
+      { ...recording, confidence: 0 },
+    ]);
+    expect(ranked.map(({ id, confidence }) => ({ id, confidence }))).toEqual([
+      { id: 1, confidence: 1 }, { id: 2, confidence: 1 },
+    ]);
+    expect(hasCompatibleDuration(live, ranked[0])).toBe(true);
+  });
+
+  it("automatically resolves the Live recording with compact artist spelling", async () => {
+    const fetchMock = vi.fn(async (url: string) => new Response(JSON.stringify(
+      url.includes("/api/search?") ? [recording] : recording,
+    )));
+    vi.stubGlobal("fetch", fetchMock);
+    const record = await getLyricsByMetadata(live);
+    expect(record).toMatchObject({ id: 1, mode: "lineSynced", artistName: "beegees" });
+    expect(record?.lines[0].startMs).toBe(9_000);
+    expect(fetchMock.mock.calls.map(([url]) => new URL(url).pathname)).toEqual(["/api/search", "/api/get/1"]);
+  });
+
+  it("recognizes the same artist spelling in direct lookups and cached records", async () => {
+    const audio = { ...live, title: "I Started A Joke", mediaType: "audio" as const };
+    const record = { ...recording, trackName: audio.title };
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(record))));
+    expect(await getLyricsByMetadata(audio)).toMatchObject({ id: 1, mode: "lineSynced" });
+    expect(isCompatibleRecord(audio, record as LyricsRecord)).toBe(true);
+  });
+
+  it.each(["Bee Gees", "beegees", "BEE-GEES", "Bee.Gees"])("handles the equivalent %s spelling in artist prefixes", (artistName) => {
+    const ranked = rankCandidates(live, [{ ...recording, artistName, trackName: `${artistName} - ${live.title}`, confidence: 0 }]);
+    expect(ranked[0].confidence).toBe(1);
+  });
+
+  it.each(["Beegee", "Beegees Tribute", "Beegees & Friends", "Bee Gees Tribute", "Another Artist", ""])("does not promote %s to an exact artist match", (artistName) => {
+    expect(rankCandidates(live, [{ ...recording, artistName, confidence: 0 }])[0].confidence).toBeLessThan(0.9);
+  });
+
+  it.each(["Beegee", "Beegees Tribute", "Beegees & Friends", "Another Artist"])("does not reuse a cached %s record through compact substring matching", (artistName) => {
+    expect(isCompatibleRecord(live, { ...recording, artistName } as LyricsRecord)).toBe(false);
+  });
+
+  it("does not compact track names or select a different track by the same artist", () => {
+    const song = { ...live, title: "A Part", mediaType: "audio" as const };
+    const candidate = { ...recording, trackName: "Apart", confidence: 0 };
+    expect(rankCandidates(song, [candidate])[0].confidence).toBeLessThan(0.9);
+    expect(isCompatibleRecord(song, candidate as unknown as LyricsRecord)).toBe(false);
+  });
+
+  it.each(["Live", "Acoustic", "Remix"])("keeps the %s requirement when the artist spelling matches", (version) => {
+    const song = { ...live, title: `I Started A Joke (${version})` };
+    const studio = { ...recording, trackName: "I Started A Joke", confidence: 0 };
+    const matching = { ...recording, id: 2, trackName: song.title, confidence: 0 };
+    const ranked = rankCandidates(song, [studio, matching]);
+    expect(ranked[0]).toMatchObject({ id: 2, confidence: 1 });
+    expect(ranked[1].confidence).toBeLessThan(0.9);
+  });
+
+  it("still rejects studio lyrics for a clip even through a clean title alternative", () => {
+    const clip = { ...live, title: "I Started A Joke (Official Video)", mediaType: "clip" as const,
+      lookupAlternatives: [{ artist: "Bee Gees", title: "I Started A Joke" }] };
+    const studio = { ...recording, trackName: "I Started A Joke", confidence: 0 };
+    expect(rankCandidates(clip, [studio])[0].confidence).toBeLessThan(0.9);
+    expect(isCompatibleRecord(clip, studio as unknown as LyricsRecord)).toBe(false);
+  });
+
+  it("still requires a compatible duration even for an exact compact artist match", () => {
+    const candidate = { ...recording, duration: 220, confidence: 0 };
+    expect(hasCompatibleDuration(live, rankCandidates(live, [candidate])[0])).toBe(false);
+    expect(isCompatibleRecord(live, candidate as unknown as LyricsRecord)).toBe(false);
+  });
+});
+
+describe("editorial search fallback", () => {
+  const clip: VideoMetadata = {
+    ...metadata, title: "The Summer Is Magic (4K Official Video)", artist: "Playahitty", duration: 199.021, mediaType: "clip",
+  };
+  const studio: LrclibRecord = {
+    id: 37071365, trackName: "The Summer Is Magic", artistName: "Playahitty", duration: 209,
+    syncedLyrics: "[00:00.25] First line",
+  };
+
+  it("finds lyrics when the upload title yields no results, without auto-accepting different timing", async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      const query = new URL(url).searchParams.get("q");
+      return new Response(JSON.stringify(query === "Playahitty The Summer Is Magic" ? [studio] : []));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const candidates = await searchLyricsForMetadata(clip);
+    expect(candidates).toHaveLength(1);
+    expect(fetchMock.mock.calls.map(([url]) => new URL(url).searchParams.get("q"))).toEqual([
+      "Playahitty The Summer Is Magic (4K Official Video)", "Playahitty The Summer Is Magic",
+    ]);
+    expect(rankCandidates(clip, candidates)[0].confidence).toBeLessThan(0.9);
+    expect(hasCompatibleDuration(clip, candidates[0])).toBe(false);
+    expect(isCompatibleRecord(clip, { ...studio, duration: 199 } as LyricsRecord)).toBe(false);
+  });
+
+  it("does not broaden a successful precise clip search", async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify([{ ...studio, trackName: clip.title, duration: 199 }])));
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await searchLyricsForMetadata(clip)).toHaveLength(1);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves Live when broadening an editorial title", async () => {
+    const fetchMock = vi.fn(async (_url: string) => new Response("[]"));
+    vi.stubGlobal("fetch", fetchMock);
+    await searchLyricsForMetadata({ ...clip, artist: "Chris Isaak", title: "Wicked Game (Live) (HD Official Video)" });
+    expect(fetchMock.mock.calls.map(([url]) => new URL(url).searchParams.get("q"))).toEqual([
+      "Chris Isaak Wicked Game (Live) (HD Official Video)", "Chris Isaak Wicked Game (Live)",
+    ]);
+  });
+
+  it("does not repeat a clean alternative already searched", async () => {
+    const fetchMock = vi.fn(async () => new Response("[]"));
+    vi.stubGlobal("fetch", fetchMock);
+    await searchLyricsForMetadata({ ...clip, lookupAlternatives: [{ artist: "Playahitty", title: "The Summer Is Magic" }] });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });
 

@@ -2,6 +2,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { browser } from "wxt/browser";
 import { defineContentScript } from "wxt/utils/define-content-script";
 import { readVideoMetadata } from "../src/shared/metadata";
+import { metadataKey, MetadataStabilizer } from "../src/shared/metadata-state";
 import { canShowLyricsPanel, observePlayerAvailability } from "../src/shared/player-state";
 import type { VideoMetadata } from "../src/shared/types";
 import { panelStyles } from "../src/ui/styles";
@@ -11,6 +12,14 @@ export default defineContentScript({
   matches: ["https://www.youtube.com/*"],
   runAt: "document_idle",
   main(ctx) {
+    if (ctx.isInvalid) return;
+    // A reinjection must never reuse controls whose listeners belong to an
+    // invalidated isolated world (including leftovers from older builds).
+    document.querySelectorAll("#refrao-host, .refrao-player-button, #refrao-player-styles, #refrao-reload-notice").forEach((element) => element.remove());
+    let disposed = false;
+    const isActive = () => !disposed && !ctx.isInvalid;
+    const buttons = new Set<HTMLButtonElement>();
+    let playerStyle: HTMLStyleElement | null = null;
     let visible = false;
     let metadata: VideoMetadata | null = null;
     let root: Root | null = null;
@@ -19,29 +28,31 @@ export default defineContentScript({
     let mount: HTMLDivElement | null = null;
     let routeVideoId: string | null = null;
     let navigationPending = false;
-    let navigationFromVideoId: string | null = null;
     let navigationFallbackTimer: number | undefined;
+    const metadataStabilizer = new MetadataStabilizer();
 
     const render = () => {
-      if (!root || !mount) return;
-      // A new video gets a fresh panel instance so an in-flight lookup from the
-      // previous video can never leave its lyrics mounted on the new track.
-      root.render(<Panel key={metadata?.videoId || "no-video"} visible={visible} metadata={metadata} onClose={() => { visible = false; render(); }} />);
+      if (!isActive() || !root || !mount) return;
+      // Preserve position, settings and the loading animation across navigation.
+      // Panel cancels obsolete lookups and clears old lyrics before painting.
+      root.render(<Panel visible={visible} metadata={metadata} onClose={() => { visible = false; render(); }} />);
     };
 
     const toggle = () => {
-      if (!canShowLyricsPanel(document, window.location.href)) return;
+      if (!isActive() || !canShowLyricsPanel(document, window.location.href)) return;
       visible = !visible;
       render();
     };
 
     const suspendPanel = () => {
+      if (!isActive()) return;
       const needsRender = visible || metadata !== null;
       visible = false;
       metadata = null;
       routeVideoId = null;
-      navigationFromVideoId = null;
-      if (refreshTimer) window.clearTimeout(refreshTimer);
+      metadataStabilizer.reset();
+      if (refreshTimer !== undefined) window.clearTimeout(refreshTimer);
+      refreshTimer = undefined;
       if (needsRender) render();
       document.querySelectorAll<HTMLButtonElement>(".refrao-player-button").forEach((button) => { button.hidden = true; });
     };
@@ -49,6 +60,7 @@ export default defineContentScript({
     const ensurePlayerStyles = () => {
       if (document.getElementById("refrao-player-styles")) return;
       const style = document.createElement("style");
+      playerStyle = style;
       style.id = "refrao-player-styles";
       style.textContent = `
         @keyframes refrao-note-pulse {
@@ -109,7 +121,7 @@ export default defineContentScript({
     };
 
     const ensureHost = () => {
-      if (host || !document.body) return;
+      if (!isActive() || host || !document.body) return;
       host = document.createElement("div");
       host.id = "refrao-host";
       Object.assign(host.style, { position: "fixed", inset: "0", zIndex: "2147483646", pointerEvents: "none" });
@@ -120,6 +132,7 @@ export default defineContentScript({
     };
 
     const ensurePlayerButton = () => {
+      if (!isActive()) return;
       if (!canShowLyricsPanel(document, window.location.href)) {
         suspendPanel();
         return;
@@ -139,8 +152,9 @@ export default defineContentScript({
         button.title = "Abrir letras (Refrão)";
         button.setAttribute("aria-label", "Abrir letras");
         button.appendChild(createPlayerIcon());
-        button.addEventListener("pointerdown", (event) => event.stopPropagation());
-        button.addEventListener("click", (event) => { event.stopPropagation(); ensureHost(); toggle(); });
+        buttons.add(button);
+        ctx.addEventListener(button, "pointerdown", (event) => event.stopPropagation());
+        ctx.addEventListener(button, "click", (event) => { event.stopPropagation(); ensureHost(); toggle(); });
       }
       if (!button.querySelector(".refrao-player-icon")) button.replaceChildren(createPlayerIcon());
       if (button.parentElement !== target) {
@@ -194,6 +208,7 @@ export default defineContentScript({
     };
 
     const clearStaleMetadata = () => {
+      metadataStabilizer.reset();
       if (metadata === null) return;
       metadata = null;
       render();
@@ -207,85 +222,123 @@ export default defineContentScript({
     };
 
     let refreshTimer: number | undefined;
-    const metadataFingerprint = (value: VideoMetadata | null) => value ? JSON.stringify({
-      videoId: value.videoId,
-      title: value.title,
-      artist: value.artist,
-      album: value.album,
-      duration: value.duration,
-      mediaType: value.mediaType,
-      lookupAlternatives: value.lookupAlternatives,
-    }) : "";
     const refresh = () => {
+      if (!isActive()) return;
       if (!canShowLyricsPanel(document, window.location.href)) { suspendPanel(); return; }
       // The player controls can appear before YouTube has finished exposing
       // title/channel/duration metadata. Insert the control immediately and
       // keep the debounced pass only for metadata and panel updates.
       ensurePlayerButton();
       syncRouteVideoId();
-      if (refreshTimer) window.clearTimeout(refreshTimer);
+      // Coalesce mutations without postponing the read indefinitely while
+      // YouTube updates progress, recommendations and other unrelated nodes.
+      if (refreshTimer !== undefined) return;
       refreshTimer = window.setTimeout(() => {
+        refreshTimer = undefined;
+        if (!isActive()) return;
         if (!canShowLyricsPanel(document, window.location.href)) { suspendPanel(); return; }
         if (navigationPending) return;
         const next = readVideoMetadata();
         // A YouTube SPA navigation can briefly expose the previous title while
         // the URL already points to the next video. Never resurrect metadata
         // from that transition.
-        if (next?.videoId !== routeVideoId) return;
-        if (navigationFromVideoId && next.videoId === navigationFromVideoId) return;
-        if (metadataFingerprint(next) !== metadataFingerprint(metadata)) {
+        if (!next || next.videoId !== routeVideoId) {
+          metadataStabilizer.reset();
+          refresh();
+          return;
+        }
+        if (metadataKey(next) === metadataKey(metadata)) {
+          metadataStabilizer.reset();
+          return;
+        }
+        if (metadataStabilizer.remaining(next, performance.now()) > 0) {
+          refresh();
+          return;
+        }
+        if (metadataKey(next) !== metadataKey(metadata)) {
           metadata = next;
           render();
         }
-        navigationFromVideoId = null;
         ensurePlayerButton();
       }, 180);
     };
 
     const moveForFullscreen = () => {
+      if (!isActive()) return;
       const target = document.fullscreenElement || document.body;
       if (host && target && host.parentElement !== target) target.appendChild(host);
     };
 
-    ensureHost(); ensurePlayerButton(); refresh();
     ctx.onInvalidated(observePlayerAvailability(document, () => window.location.href, (available) => {
+      if (!isActive()) return;
       if (!available) suspendPanel();
       else refresh();
     }));
-    browser.runtime.onMessage.addListener((message: { type?: string }) => {
-      if (message.type === "TOGGLE_PANEL") { ensureHost(); toggle(); }
-    });
-    document.addEventListener("fullscreenchange", moveForFullscreen);
-    document.addEventListener("yt-navigate-start", () => {
+    const onMessage = (message: { type?: string }) => {
+      if (isActive() && message.type === "TOGGLE_PANEL") { ensureHost(); toggle(); }
+    };
+    browser.runtime.onMessage.addListener(onMessage);
+    ctx.addEventListener(document, "fullscreenchange", moveForFullscreen);
+    ctx.addEventListener(document, "yt-navigate-start", () => {
+      if (!isActive()) return;
       navigationPending = true;
-      navigationFromVideoId = metadata?.videoId || routeVideoId;
-      routeVideoId = null;
       clearStaleMetadata();
       if (navigationFallbackTimer) window.clearTimeout(navigationFallbackTimer);
       navigationFallbackTimer = window.setTimeout(() => {
+        if (!isActive()) return;
         navigationPending = false;
         refresh();
       }, 1500);
     });
-    document.addEventListener("yt-navigate-finish", () => {
+    ctx.addEventListener(document, "yt-navigate-finish", () => {
+      if (!isActive()) return;
       navigationPending = false;
       if (navigationFallbackTimer) window.clearTimeout(navigationFallbackTimer);
       refresh();
     });
-    ["yt-page-data-updated", "popstate"].forEach((event) => document.addEventListener(event, refresh));
-    document.addEventListener("loadedmetadata", refresh, true);
-    document.addEventListener("durationchange", refresh, true);
+    ctx.addEventListener(document, "yt-page-data-updated", refresh);
+    ctx.addEventListener(window, "popstate", refresh);
+    ctx.addEventListener(document, "loadedmetadata", refresh, { capture: true });
+    ctx.addEventListener(document, "durationchange", refresh, { capture: true });
     const observer = new MutationObserver(() => {
       ensurePlayerButton();
       refresh();
     });
     observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
     ctx.onInvalidated(() => {
+      if (disposed) return;
+      disposed = true;
       observer.disconnect();
-      if (refreshTimer) window.clearTimeout(refreshTimer);
-      if (navigationFallbackTimer) window.clearTimeout(navigationFallbackTimer);
+      if (refreshTimer !== undefined) window.clearTimeout(refreshTimer);
+      if (navigationFallbackTimer !== undefined) window.clearTimeout(navigationFallbackTimer);
+      try { browser.runtime.onMessage.removeListener(onMessage); }
+      catch { /* Chrome may already have detached this runtime. */ }
       root?.unmount();
       host?.remove();
+      root = null; host = null; mount = null;
+      buttons.forEach((button) => button.remove());
+      buttons.clear();
+      playerStyle?.remove();
+      // No extension APIs in this notice: the old world cannot reconnect.
+      // A superseding script with a valid runtime replaces the UI instead.
+      if (!browser.runtime.id && document.body) {
+        const notice = document.createElement("div");
+        notice.id = "refrao-reload-notice";
+        notice.setAttribute("role", "status");
+        Object.assign(notice.style, { position: "fixed", right: "24px", bottom: "24px", zIndex: "2147483646", padding: "16px", borderRadius: "12px", color: "#fff", background: "#22222b", font: "14px system-ui", maxWidth: "360px" });
+        const text = document.createElement("p");
+        text.textContent = "O Refrão foi atualizado ou desconectado. Recarregue esta página para continuar.";
+        const reload = document.createElement("button");
+        reload.type = "button";
+        reload.textContent = "Recarregar YouTube";
+        reload.addEventListener("click", () => window.location.reload());
+        notice.append(text, reload);
+        document.body.appendChild(notice);
+      }
     });
+    // WXT detects a detached runtime when isInvalid/isValid is checked. Its
+    // managed interval also catches reloads while YouTube is otherwise idle.
+    ctx.setInterval(() => {}, 1000);
+    ensureHost(); ensurePlayerButton(); refresh();
   },
 });

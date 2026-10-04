@@ -4,6 +4,7 @@ import { defaultSettings, loadSettings, loadVideoOffset, saveSettings, saveVideo
 import type { CandidateRecord, ExtensionResponse, LyricsLine, LyricsRecord, UserSettings, VideoMetadata } from "../shared/types";
 import { activeLineIndex, lineToCenterIndex } from "./timing";
 import { sendLyricsRequest, type LyricsRequest } from "./lyrics-request";
+import { metadataKey } from "../shared/metadata-state";
 
 interface PanelProps {
   visible: boolean;
@@ -12,6 +13,7 @@ interface PanelProps {
 }
 
 function readableError(error: string): string {
+  if (error.includes("Extension context invalidated")) return "A extensão foi atualizada ou desconectada. Recarregue esta página do YouTube.";
   if (error === "LRCLIB_429") return "O LRCLIB pediu para aguardar antes de tentar novamente.";
   if (error === "LRCLIB_503") return "O LRCLIB está temporariamente indisponível.";
   if (error.startsWith("LRCLIB_")) return "O serviço de letras recusou esta consulta.";
@@ -155,6 +157,8 @@ export function Panel({ visible, metadata, onClose }: PanelProps) {
   // empty/manual-search state before the first lookup effect runs.
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [storageError, setStorageError] = useState("");
+  const mounted = useRef(false);
   const [highlightedLineId, setHighlightedLineId] = useState<string | null>(null);
   const [userScrolled, setUserScrolled] = useState(false);
   const [drag, setDrag] = useState<{ kind: "drag" | "resize"; x: number; y: number; bounds: UserSettings["bounds"] } | null>(null);
@@ -181,32 +185,46 @@ export function Panel({ visible, metadata, onClose }: PanelProps) {
     pendingRequest.current = controller;
     return { promise: sendLyricsRequest(message, controller.signal), generation: lookupGeneration.current };
   };
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!visible) cancelPendingRequest();
     return cancelPendingRequest;
   }, [visible]);
 
-  useEffect(() => { void loadSettings().then(setSettings); }, []);
+  useEffect(() => {
+    mounted.current = true;
+    let active = true;
+    void loadSettings().then((value) => { if (active) setSettings(value); }).catch((caught) => {
+      if (active) reportStorageError(caught);
+    });
+    return () => { active = false; mounted.current = false; };
+  }, []);
+  const reportStorageError = (caught: unknown) => {
+    if (!mounted.current) return;
+    const detail = caught instanceof Error ? readableError(caught.message) : "Armazenamento indisponível.";
+    setStorageError(`Não foi possível acessar as configurações salvas. ${detail}`);
+  };
   useEffect(() => {
     let active = true;
     setVideoOffsetMs(0);
     if (!metadata?.videoId) return undefined;
     void loadVideoOffset(metadata.videoId).then((value) => {
       if (active) setVideoOffsetMs(clampOffset(value));
+    }).catch((caught) => {
+      if (active) reportStorageError(caught);
     });
     return () => { active = false; };
   }, [metadata?.videoId]);
   const updateSettings = (patch: Partial<UserSettings>) => {
     setSettings((current) => {
       const next = { ...current, ...patch };
-      void saveSettings(next);
+      void saveSettings(next).catch(reportStorageError);
       return next;
     });
   };
   const adjustOffset = (delta: number) => {
     setVideoOffsetMs((current) => {
       const next = clampOffset(current + delta);
-      if (metadata?.videoId) void saveVideoOffset(metadata.videoId, next);
+      if (metadata?.videoId) void saveVideoOffset(metadata.videoId, next).catch(reportStorageError);
       return next;
     });
   };
@@ -214,7 +232,7 @@ export function Panel({ visible, metadata, onClose }: PanelProps) {
   const setOffset = (value: number) => {
     const next = clampOffset(value);
     setVideoOffsetMs(next);
-    if (metadata?.videoId) void saveVideoOffset(metadata.videoId, next);
+    if (metadata?.videoId) void saveVideoOffset(metadata.videoId, next).catch(reportStorageError);
   };
 
   const stopOffsetHold = () => {
@@ -275,17 +293,36 @@ export function Panel({ visible, metadata, onClose }: PanelProps) {
       setLoading(false);
       if (!response.ok) { setError(readableError(response.error)); return; }
       setRecord(response.record); setCandidates(response.candidates || []);
-    }).catch(() => { if (!cancelled && generation === lookupGeneration.current) { setLoading(false); setError("Não foi possível consultar as letras."); } });
+    }).catch((caught) => {
+      if (!cancelled && generation === lookupGeneration.current) {
+        setLoading(false);
+        setError(readableError(caught instanceof Error ? caught.message : "Não foi possível consultar as letras."));
+      }
+    });
     return () => {
       cancelled = true;
       if (generation === lookupGeneration.current) cancelPendingRequest();
     };
   };
 
-  useEffect(() => {
-    if (!visible || !metadata) return undefined;
+  // Reset the song-specific state before painting, without remounting the
+  // panel. Otherwise old lyrics/header can flash once on a new video.
+  useLayoutEffect(() => {
+    if (!visible) return undefined;
+    stopOffsetHold();
+    cancelScrollAnimation();
+    setSyncOpen(false);
+    setQuery("");
+    lastAutoScroll.current = { index: -1, at: 0 };
+    programmaticScrollUntil.current = 0;
+    if (!metadata) {
+      cancelPendingRequest();
+      setRecord(null); setCandidates([]); setError(""); setLoading(true);
+      setSelectionMode(false); setHighlightedLineId(null); setUserScrolled(false);
+      return undefined;
+    }
     return beginLookup(metadata);
-  }, [visible, metadata?.videoId, metadata?.title, metadata?.artist, metadata?.duration, metadata?.mediaType, metadata?.isAd]);
+  }, [visible, metadataKey(metadata)]);
 
   const index = useMemo(() => record && isTimed ? activeLineIndex(record.lines, timeMs) : -1, [record, isTimed, timeMs]);
   const centerIndex = useMemo(() => record && isTimed ? lineToCenterIndex(record.lines, timeMs) : -1, [record, isTimed, timeMs]);
@@ -485,7 +522,7 @@ export function Panel({ visible, metadata, onClose }: PanelProps) {
         : { ...drag.bounds, width: Math.max(320, Math.min(window.innerWidth - 16, drag.bounds.width + dx)), height: Math.max(360, Math.min(window.innerHeight - 16, drag.bounds.height + dy)) };
       setSettings((current) => ({ ...current, bounds: next }));
     };
-    const onUp = () => { setDrag(null); setSettings((current) => { void saveSettings(current); return current; }); };
+    const onUp = () => { setDrag(null); setSettings((current) => { void saveSettings(current).catch(reportStorageError); return current; }); };
     window.addEventListener("pointermove", onMove); window.addEventListener("pointerup", onUp, { once: true });
     return () => { window.removeEventListener("pointermove", onMove); window.removeEventListener("pointerup", onUp); };
   }, [drag]);
@@ -522,6 +559,7 @@ export function Panel({ visible, metadata, onClose }: PanelProps) {
     </header>
     <div className="status"><span className={`badge${record?.mode === "wordSynced" || record?.mode === "lineSynced" ? " good" : ""}`}>{metadata?.isAd ? "Aguardando o vídeo" : loading ? (metadata ? "Buscando…" : "Carregando…") : record ? (record.mode === "instrumental" ? "Sem letra disponível" : record.mode === "plain" ? "Sem sincronização" : "Sincronizada") : "Aguardando"}</span><span>{metadata?.duration ? `${Math.floor(metadata.duration / 60)}:${String(Math.floor(metadata.duration % 60)).padStart(2, "0")}` : ""}</span></div>
     <div className="lyrics-scroll" ref={scrollRef} onWheel={cancelScrollAnimation} onScroll={() => { if (!drag && Date.now() > programmaticScrollUntil.current) setUserScrolled(true); }}>
+      {storageError && <p className="error" role="alert">{storageError}</p>}
       {metadata?.isAd && <div className="empty-state"><strong>O anúncio está terminando</strong><p>A letra será buscada quando a duração real da música estiver disponível.</p></div>}
       {loading && !metadata?.isAd && <LoadingState metadata={metadata} />}
       {!loading && !error && record && record.mode === "instrumental" && <div className="empty-state"><strong>Letra não encontrada</strong><p>O LRCLIB não possui uma letra para esta gravação.</p></div>}

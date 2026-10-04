@@ -41,4 +41,34 @@ describe("cancelable lyrics requests", () => {
     expect(() => sendLyricsRequest({ type: "GET_LYRICS_BY_ID", id: 1 }, controller.signal)).toThrow();
     expect(sendMessage).not.toHaveBeenCalled();
   });
+
+  it("still rejects cancellation when Chrome throws synchronously in an invalid context", async () => {
+    sendMessage.mockImplementationOnce(() => new Promise(() => {}));
+    sendMessage.mockImplementationOnce(() => { throw new Error("Extension context invalidated."); });
+    const controller = new AbortController();
+    const result = sendLyricsRequest({ type: "SEARCH_LYRICS", query: "Song" }, controller.signal);
+    const assertion = expect(result).rejects.toMatchObject({ name: "AbortError" });
+    expect(() => controller.abort()).not.toThrow();
+    await assertion;
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it("removes the abort listener when the initial Chrome call throws synchronously", async () => {
+    sendMessage.mockImplementation(() => { throw new Error("Extension context invalidated."); });
+    const controller = new AbortController();
+    await expect(sendLyricsRequest({ type: "GET_LYRICS_BY_ID", id: 1 }, controller.signal)).rejects.toThrow("Extension context invalidated");
+    controller.abort();
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("handles an asynchronously rejected cancellation notification", async () => {
+    sendMessage.mockImplementationOnce(() => new Promise(() => {}));
+    sendMessage.mockRejectedValueOnce(new Error("Extension context invalidated."));
+    const controller = new AbortController();
+    const result = sendLyricsRequest({ type: "SEARCH_LYRICS", query: "Song" }, controller.signal);
+    const assertion = expect(result).rejects.toMatchObject({ name: "AbortError" });
+    controller.abort();
+    await assertion;
+    await Promise.resolve();
+  });
 });

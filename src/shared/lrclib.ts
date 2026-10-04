@@ -1,5 +1,5 @@
 import { parseRecord } from "./parsers";
-import { normalizeText } from "./metadata";
+import { cleanEditorialSuffix, normalizeText } from "./metadata";
 import type { CandidateRecord, LyricsLookup, LyricsRecord, LrclibRecord, VideoMetadata } from "./types";
 import { LRCLIB_CLIENT } from "./types";
 
@@ -225,7 +225,8 @@ export function getLookupSignatures(metadata: VideoMetadata): LyricsLookup[] {
 
 export async function searchLyricsForMetadata(metadata: VideoMetadata, signal?: AbortSignal): Promise<CandidateRecord[]> {
   const queries = new Map<string, string>();
-  for (const signature of getLookupSignatures(metadata)) {
+  const signatures = getLookupSignatures(metadata);
+  for (const signature of signatures) {
     const query = `${signature.artist} ${signature.title}`.trim();
     queries.set(normalizeText(query), query);
   }
@@ -235,7 +236,30 @@ export async function searchLyricsForMetadata(metadata: VideoMetadata, signal?: 
     if (index > 0) await wait(REQUEST_GAP_MS, signal);
     for (const candidate of await searchLyrics(values[index], signal)) candidates.set(candidate.id, candidate);
   }
+  // The LRCLIB search treats upload labels as search terms. If the precise
+  // video name has no matches, discover candidates without editorial suffixes.
+  // Keep recording modifiers (Live, Remix, etc.) and the original metadata
+  // for ranking: finding lyrics is not proof that their timing fits the clip.
+  if (!candidates.size) {
+    for (const signature of signatures) {
+      const title = cleanEditorialSuffix(signature.title);
+      if (!title || title === signature.title) continue;
+      const query = `${signature.artist} ${title}`.trim();
+      const key = normalizeText(query);
+      if (queries.has(key)) continue;
+      queries.set(key, query);
+      await wait(REQUEST_GAP_MS, signal);
+      for (const candidate of await searchLyrics(query, signal)) candidates.set(candidate.id, candidate);
+    }
+  }
   return [...candidates.values()];
+}
+
+function sameNormalizedArtist(expected: string, actual: string): boolean {
+  // Compare the full names, never compact substrings. This handles "Bee Gees"
+  // vs "beegees" without promoting a tribute act or a collaboration to exact.
+  return Boolean(expected && actual)
+    && (expected === actual || expected.replace(/ /g, "") === actual.replace(/ /g, ""));
 }
 
 function scoreCandidate(signature: LyricsLookup, metadata: VideoMetadata, candidate: CandidateRecord): { confidence: number; sortScore: number; durationDelta: number } {
@@ -245,13 +269,18 @@ function scoreCandidate(signature: LyricsLookup, metadata: VideoMetadata, candid
   const candidateTitle = normalizeText(candidate.trackName || candidate.name || "");
   const candidateArtist = normalizeText(candidate.artistName || "");
   const candidateAlbum = normalizeText(candidate.albumName || "");
-  const titleWithoutArtist = artist && candidateTitle.startsWith(`${artist} `) ? candidateTitle.slice(artist.length + 1) : candidateTitle;
+  const exactArtistMatch = sameNormalizedArtist(artist, candidateArtist);
+  const titleWithoutArtist = artist && candidateTitle.startsWith(`${artist} `)
+    ? candidateTitle.slice(artist.length + 1)
+    : exactArtistMatch && candidateTitle.startsWith(`${candidateArtist} `)
+      ? candidateTitle.slice(candidateArtist.length + 1)
+      : candidateTitle;
   const titleMatch = candidateTitle === title || titleWithoutArtist === title
     ? 0.55
     : candidateTitle.includes(title) || title.includes(candidateTitle) || titleWithoutArtist.includes(title) || title.includes(titleWithoutArtist)
       ? 0.32
       : 0;
-  const artistMatch = artist ? (candidateArtist === artist ? 0.35 : (candidateArtist.includes(artist) || artist.includes(candidateArtist)) ? 0.2 : 0) : 0;
+  const artistMatch = artist ? (exactArtistMatch ? 0.35 : (candidateArtist.includes(artist) || artist.includes(candidateArtist)) ? 0.2 : 0) : 0;
   const durationDelta = metadata.duration > 0 && candidate.duration ? Math.abs(metadata.duration - candidate.duration) : 30;
   const durationMatch = durationDelta <= 3 ? 0.1 : durationDelta <= 10 ? 0.05 : 0;
   const albumMatch = album && candidateAlbum ? (candidateAlbum === album ? 0.16 : candidateAlbum.includes(album) || album.includes(candidateAlbum) ? 0.08 : 0) : 0;
@@ -293,7 +322,7 @@ export function isCompatibleRecord(metadata: VideoMetadata, record: LyricsRecord
     const expectedArtist = normalizeText(signature.artist);
     const recordArtist = normalizeText(record.artistName);
     const titleMatches = !expectedTitle || !recordTitle || recordTitle === expectedTitle || recordTitle.includes(expectedTitle) || expectedTitle.includes(recordTitle);
-    const artistMatches = !expectedArtist || !recordArtist || recordArtist === expectedArtist || recordArtist.includes(expectedArtist) || expectedArtist.includes(recordArtist);
+    const artistMatches = !expectedArtist || !recordArtist || sameNormalizedArtist(expectedArtist, recordArtist) || recordArtist.includes(expectedArtist) || expectedArtist.includes(recordArtist);
     return titleMatches && artistMatches;
   });
 }

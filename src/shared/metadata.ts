@@ -57,11 +57,11 @@ export function normalizeText(value: string): string {
     .trim();
 }
 
-function cleanEditorialSuffix(value: string): string {
+export function cleanEditorialSuffix(value: string): string {
   return value
     .replace(/\s*[-|•]\s*(official|lyrics?|audio|music video).*$/i, "")
-    .replace(/\s*\((official|lyrics?|audio|music video|visualizer)[^)]*\)$/i, "")
-    .replace(/\s*\[(official|lyrics?|audio|music video|visualizer)[^\]]*\]$/i, "")
+    .replace(/\s*\((?:(?:4k|8k|uhd|hd|hq|\d{3,4}p|\d{2,3}fps)\s+)*(official|lyrics?|audio|music video|visualizer)[^)]*\)$/i, "")
+    .replace(/\s*\[(?:(?:4k|8k|uhd|hd|hq|\d{3,4}p|\d{2,3}fps)\s+)*(official|lyrics?|audio|music video|visualizer)[^\]]*\]$/i, "")
     .trim();
 }
 
@@ -133,8 +133,16 @@ function readStructuredText(value: unknown): string {
   return "";
 }
 
-function readMusicFromInitialData(): LyricsLookup | null {
+const initialDataVideoIds = new WeakMap<object, string>();
+
+function readMusicFromInitialData(videoId: string): LyricsLookup | null {
   const root = asRecord((window as Window & { ytInitialData?: unknown }).ytInitialData);
+  if (!root) return null;
+  // ytInitialData can remain the initial page's snapshot after SPA navigation.
+  const endpoint = asRecord(asRecord(root.currentVideoEndpoint)?.watchEndpoint);
+  const sourceId = typeof endpoint?.videoId === "string" ? endpoint.videoId : initialDataVideoIds.get(root);
+  if (sourceId && sourceId !== videoId) return null;
+  initialDataVideoIds.set(root, videoId);
   const panels = Array.isArray(root?.engagementPanels) ? root.engagementPanels : [];
   for (const panel of panels) {
     const panelRecord = asRecord(panel);
@@ -172,8 +180,23 @@ function readMusicFromDom(): LyricsLookup | null {
   return null;
 }
 
-function readYouTubeMusicMetadata(): LyricsLookup | null {
-  return readMusicFromInitialData() || readMusicFromDom();
+function readYouTubeMusicMetadata(videoId: string): LyricsLookup | null {
+  return readMusicFromDom() || readMusicFromInitialData(videoId);
+}
+
+function musicCardMatchesTitle(music: LyricsLookup, titles: string[]): boolean {
+  const cardTitle = normalizeText(music.title);
+  const hasExplicitVersion = titles.some(hasVersionTitleHint);
+  return titles.some((title) => {
+    const expected = normalizeText(title);
+    if (!expected || !cardTitle) return false;
+    if (cardTitle === expected) return true;
+    // A plain title does not authorize a different suffix: YouTube can label
+    // the English video "Spanish Version" or "French Radio Mix". Extended
+    // names remain alternatives when the video explicitly names a version.
+    if (!hasExplicitVersion) return false;
+    return cardTitle.startsWith(`${expected} `) || expected.startsWith(`${cardTitle} `);
+  });
 }
 
 interface ParsedMusicTitle {
@@ -192,8 +215,15 @@ function cleanAlbumName(value: string): string {
 function splitAlbumContext(value: string): { title: string; album?: string; fromPipe: boolean } {
   const pipeIndex = value.lastIndexOf("|");
   if (pipeIndex > 0) {
-    const album = cleanAlbumName(value.slice(pipeIndex + 1));
-    if (album) return { title: value.slice(0, pipeIndex).trim(), album, fromPipe: true };
+    const title = value.slice(0, pipeIndex).trim();
+    const suffix = value.slice(pipeIndex + 1);
+    // A single pipe commonly separates artist and song, not song and album
+    // (e.g. "TWO DOOR CINEMA CLUB | WHAT YOU KNOW"). Album context needs
+    // either an already-separated artist/title or an explicit album label.
+    const hasArtistAndTrack = /\s+[-–—]\s+|\|/.test(title);
+    const hasAlbumLabel = /^\s*(?:(?:do|from)\s+)?(?:álbum|album)\b/i.test(suffix);
+    const album = cleanAlbumName(suffix);
+    if (album && (hasArtistAndTrack || hasAlbumLabel)) return { title, album, fromPipe: true };
   }
   const albumMatch = value.match(/\s*[\[(]\s*(?:(?:do|from)\s+)?(?:álbum|album)\s*[:\-–—]?\s*([^\])]+)[\])]\s*$/i);
   if (albumMatch?.[1]) {
@@ -231,7 +261,7 @@ function parseArtist(rawTitle: string, channel: string): ParsedMusicTitle {
     }
   }
 
-  const split = title.split(/\s+[-–—|]\s+/);
+  const split = title.split(/\s+[-–—]\s+|\s*\|\s*/);
   if (split.length >= 2 && split[0].length <= 80) {
     const artist = split[0].trim();
     const track = split.slice(1).join(" - ").trim();
@@ -266,6 +296,10 @@ export function readVideoMetadata(): VideoMetadata | null {
   const videoId = url.searchParams.get("v");
   const video = document.querySelector<HTMLVideoElement>("video");
   if (!videoId || !video) return null;
+  const watchVideoId = document.querySelector("ytd-watch-flexy[video-id]")?.getAttribute("video-id");
+  // URL, watch-page DOM and player are updated separately during navigation.
+  // Do not stamp the new URL onto the previous page's title or music card.
+  if (watchVideoId && watchVideoId !== videoId) return null;
   const isAd = Boolean(document.querySelector("#movie_player.ad-showing, .ad-showing, [ad-showing]"));
 
   const rawTitle = getRawTitle();
@@ -273,7 +307,10 @@ export function readVideoMetadata(): VideoMetadata | null {
   const channel = getChannel();
   const parsed = parseArtist(title, channel);
   const rawParsed = rawTitle === title ? parsed : parseArtist(rawTitle, channel);
-  const music = readYouTubeMusicMetadata();
+  const musicCard = readYouTubeMusicMetadata(videoId);
+  const music = musicCard && musicCardMatchesTitle(musicCard, [
+    parsed.track, rawParsed.track, ...(parsed.lookupAlternatives || []).map((lookup) => lookup.title),
+  ]) ? musicCard : null;
   const fallbackLookup: LyricsLookup = { artist: parsed.artist, title: parsed.track, ...(parsed.album ? { album: parsed.album } : {}) };
   const rawLookup: LyricsLookup = { artist: rawParsed.artist, title: rawParsed.track, ...(rawParsed.album ? { album: rawParsed.album } : {}) };
   const mediaType = detectMediaType(rawTitle, channel);
@@ -298,6 +335,8 @@ export function readVideoMetadata(): VideoMetadata | null {
     duration,
     isAd,
     thumbnailUrl: `https://i.ytimg.com/vi/${encodeURIComponent(videoId)}/hqdefault.jpg`,
-    likelyMusic: Boolean(music) || isLikelyMusicVideo(rawTitle, channel),
+    // A music card still identifies musical content when its recording name
+    // is wrong (as in Angels); only its lookup fields must be discarded.
+    likelyMusic: Boolean(musicCard) || isLikelyMusicVideo(rawTitle, channel),
   };
 }
